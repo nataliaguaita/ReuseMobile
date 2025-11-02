@@ -1,101 +1,122 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
+// context/AuthContext.tsx
+import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
+import {
+  initializeAuth,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+  GoogleAuthProvider,
+  signInWithCredential,
+  updateProfile,
+  sendPasswordResetEmail,
+  User,
+} from 'firebase/auth';
+import * as Auth from 'firebase/auth'; // 👈 vamos pegar o helper daqui via "as any"
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Google from 'expo-auth-session/providers/google';
+import * as WebBrowser from 'expo-web-browser';
+import * as AuthSession from 'expo-auth-session';
+import { app } from '../src/services/firebase';
 
-type User = {
-    id: string;
-    name: string;
-    email: string;
-    password: string;
-};
+WebBrowser.maybeCompleteAuthSession();
 
-type AuthContextType = {
-    user: User | null;
-    isLoading: boolean;
-    login: (email: string, password: string) => Promise<string | null>;
-    register: (name: string, email: string, password: string) => Promise<string | null>;
-    logout: () => Promise<void>;
-};
+interface AuthContextType {
+  user: User | null;
+  loading: boolean;
+  login: (email: string, password: string) => Promise<string | null>;
+  register: (name: string, email: string, password: string) => Promise<string | null>;
+  logout: () => Promise<void>;
+  loginWithGoogle: () => Promise<string | null>;
+  forgotPassword: (email: string) => Promise<string | null>;
+}
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+const AuthContext = createContext<AuthContextType>({} as AuthContextType);
 
-export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-    const [user, setUser] = useState<User | null>(null);
-    const [isLoading, setIsLoading] = useState(true);
+// ✅ Persistência com AsyncStorage (resolve o WARN do Firebase)
+const auth = initializeAuth(app, {
+  persistence: (Auth as any).getReactNativePersistence(AsyncStorage),
+});
+// Redirect URI (usado no login com Google)
+const redirectUri = AuthSession.makeRedirectUri();
 
-    useEffect(() => {
-        const loadUser = async () => {
-            try {
-                const storedUser = await AsyncStorage.getItem('@loggedUser');
-                if (storedUser) setUser(JSON.parse(storedUser));
-            } catch (error) {
-                console.error("Erro ao carregar usuário logado:", error);
-            } finally {
-                setIsLoading(false);
-            }
-        };
-        loadUser();
-    }, []);
+export const AuthProvider = ({ children }: { children: ReactNode }) => {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
 
-    // Validação simples
-    const isValidEmail = (email: string) => /\S+@\S+\.\S+/.test(email);
+  const [_request, response, promptAsync] = Google.useAuthRequest({
+    clientId: '257764412083-ctdqj4lnip13fcdkuoonqhnnek5pdrhn.apps.googleusercontent.com',
+    redirectUri,
+  });
 
-    // Cadastro → salva o usuário em uma lista
-    const register = async (name: string, email: string, password: string) => {
-        if (name.trim().length < 3) return "O nome deve ter pelo menos 3 caracteres.";
-        if (!isValidEmail(email)) return "Email inválido.";
-        if (password.length < 7) return "A senha deve ter pelo menos 7 caracteres.";
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (usr) => {
+      setUser(usr);
+      setLoading(false);
+    });
+    return unsub;
+  }, []);
 
-        const storedUsers = await AsyncStorage.getItem('@users');
-        const users = storedUsers ? JSON.parse(storedUsers) : [];
-
-        // Evita emails duplicados
-        if (users.some((u: User) => u.email === email)) {
-            return "Este email já está cadastrado.";
-        }
-
-        const newUser: User = { id: Date.now().toString(), name, email, password };
-        users.push(newUser);
-
-        await AsyncStorage.setItem('@users', JSON.stringify(users));
-        await AsyncStorage.setItem('@loggedUser', JSON.stringify(newUser));
-
-        setUser(newUser);
-        return null;
+  useEffect(() => {
+    const go = async () => {
+      if (response?.type === 'success') {
+        const { id_token } = response.params;
+        const credential = GoogleAuthProvider.credential(id_token);
+        await signInWithCredential(auth, credential);
+      }
     };
+    go();
+  }, [response]);
 
-    //  Login → só funciona se já existir cadastro
-    const login = async (email: string, password: string) => {
-        if (!isValidEmail(email)) return "Email inválido.";
-        if (password.length < 7) return "A senha deve ter pelo menos 7 caracteres.";
+  const login = async (email: string, password: string) => {
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+      return null;
+    } catch (e: any) {
+      return e?.message ?? 'Erro ao logar';
+    }
+  };
 
-        const storedUsers = await AsyncStorage.getItem('@users');
-        const users = storedUsers ? JSON.parse(storedUsers) : [];
+  const register = async (name: string, email: string, password: string) => {
+    try {
+      await createUserWithEmailAndPassword(auth, email, password);
+      if (auth.currentUser) await updateProfile(auth.currentUser, { displayName: name });
+      return null;
+    } catch (e: any) {
+      return e?.message ?? 'Erro ao registrar';
+    }
+  };
 
-        const existingUser = users.find(
-            (u: User) => u.email === email && u.password === password
-        );
+  const logout = async () => {
+    await signOut(auth);
+  };
 
-        if (!existingUser) return "Usuário ou senha incorretos.";
+  const loginWithGoogle = async () => {
+    try {
+      const result = await promptAsync();
+      if (result.type !== 'success') return 'Login com Google cancelado.';
+      return null;
+    } catch (e: any) {
+      return e?.message ?? 'Erro no login com Google';
+    }
+  };
 
-        await AsyncStorage.setItem('@loggedUser', JSON.stringify(existingUser));
-        setUser(existingUser);
-        return null;
-    };
+  const forgotPassword = async (email: string) => {
+    try {
+      await sendPasswordResetEmail(auth, email);
+      return null;
+    } catch (e: any) {
+      return e?.message ?? 'Erro ao enviar e-mail de recuperação';
+    }
+  };
 
-    const logout = async () => {
-        setUser(null);
-        await AsyncStorage.removeItem('@loggedUser');
-    };
-
-    return (
-        <AuthContext.Provider value={{ user, isLoading, login, register, logout }}>
-            {children}
-        </AuthContext.Provider>
-    );
+  return (
+    <AuthContext.Provider
+      value={{ user, loading, login, register, logout, loginWithGoogle, forgotPassword }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
 };
 
-export const useAuth = () => {
-    const context = useContext(AuthContext);
-    if (!context) throw new Error("useAuth deve ser usado dentro de AuthProvider");
-    return context;
-};
+export const useAuth = () => useContext(AuthContext);
